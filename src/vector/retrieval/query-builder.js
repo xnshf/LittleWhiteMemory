@@ -1,0 +1,368 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// query-builder.js - 确定性查询构建器（无 LLM）
+//
+// 职责：
+// 1. 从最近 3 条消息构建 QueryBundle（加权向量段）
+// 2. 用第一轮召回结果产出 hints 段用于 R2 增强
+//
+// 加权向量设计：
+// - 每条消息独立 embed，得到独立向量
+// - 按位置分配基础权重（焦点 > 近上下文 > 远上下文）
+// - 短消息通过 lengthFactor 自动降权（下限 35%）
+// - recall.js 负责 embed + 归一化 + 加权平均
+//
+// 焦点确定：lastMessages 最后一条是真实入列的当前 USER 消息
+//
+// 不负责：向量化、检索、rerank
+// ═══════════════════════════════════════════════════════════════════════════
+
+import { getContext } from '../../../../../../extensions.js';
+import {
+    getEntityVocabulary,
+    normalizeEntityTerm,
+} from './entity-lexicon.js';
+import { getLexicalIdfAccessor } from './lexical-index.js';
+import { getSummaryStore } from '../../summary/data/store.js';
+import { cleanRecallMessageText as cleanMessageText } from '../utils/text-filter.js';
+import { getTokenizerSnapshot, injectEntities, tokenizeForIndex as tokenizerTokenizeForIndex } from '../utils/tokenizer.js';
+import { buildBoundedRerankQuery } from './rerank-query.js';
+import { boundRecallEmbeddingSegment } from './recall-query-bounds.js';
+import { resolveFocusCharacters } from './event-recall-classification.js';
+import { CONTEXT_BASE_WEIGHTS, FOCUS_BASE_WEIGHT, HINTS_BASE_WEIGHT } from './query-weights.js';
+export {
+    FOCUS_BASE_WEIGHT, CONTEXT_BASE_WEIGHTS,
+    FOCUS_BASE_WEIGHT_R2, CONTEXT_BASE_WEIGHTS_R2, HINTS_BASE_WEIGHT,
+    LENGTH_FULL_THRESHOLD, LENGTH_MIN_FACTOR, FOCUS_MIN_NORMALIZED_WEIGHT,
+    computeLengthFactor,
+} from './query-weights.js';
+
+// ─────────────────────────────────────────────────────────────────────────
+// 其他常量
+// ─────────────────────────────────────────────────────────────────────────
+
+const MEMORY_HINT_ATOMS_MAX = 5;
+const MEMORY_HINT_EVENTS_MAX = 3;
+const LEXICAL_TERMS_MAX = 10;
+
+// ─────────────────────────────────────────────────────────────────────────
+// 工具函数
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * 清理事件摘要（移除楼层标记）
+ * @param {string} summary
+ * @returns {string}
+ */
+function cleanSummary(summary) {
+    return String(summary || '')
+        .replace(/\s*\(#\d+(?:-\d+)?\)\s*$/, '')
+        .trim();
+}
+
+/**
+ * 从文本中提取高频实词（用于词法检索）
+ *
+ * @param {string} text - 清洗后的文本
+ * @param {number} maxTerms - 最大词数
+ * @returns {string[]}
+ */
+function extractKeyTerms(text, maxTerms = LEXICAL_TERMS_MAX) {
+    if (!text) return [];
+
+    const idfAccessor = getLexicalIdfAccessor();
+    const tokens = tokenizerTokenizeForIndex(text);
+    const freq = new Map();
+    for (const token of tokens) {
+        const key = String(token || '').toLowerCase();
+        if (!key) continue;
+        freq.set(key, (freq.get(key) || 0) + 1);
+    }
+
+    return Array.from(freq.entries())
+        .map(([term, tf]) => {
+            const idf = idfAccessor.enabled ? idfAccessor.getIdf(term) : 1;
+            return { term, tf, score: tf * idf };
+        })
+        .sort((a, b) => (b.score - a.score) || (b.tf - a.tf))
+        .slice(0, maxTerms)
+        .map(x => x.term);
+}
+
+/**
+ * Replay-only construction diagnostic for a pending-focus candidate.
+ * It describes the current bundle and the fixed H-Q-FOCUS arm without selecting the arm.
+ * @param {QueryBundle} bundle
+ * @returns {object}
+ */
+export function describeQueryFocusOwnership(bundle) {
+    const focusText = String(bundle?.focusQuery || '');
+    const focusTerms = bundle?._extractEntities?.(focusText) || [];
+    const focusCharacters = resolveFocusCharacters(
+        focusTerms,
+        bundle?.trustedCharacters,
+        [bundle?._context?.name1],
+    );
+    const focusLexicalTerms = Array.from(new Set([
+        ...focusTerms.map(normalizeEntityTerm).filter(Boolean),
+        ...extractKeyTerms(focusText),
+    ])).slice(0, LEXICAL_TERMS_MAX);
+    return {
+        baseline: {
+            focusTerms: [...(bundle?.focusTerms || [])],
+            focusCharacters: [...(bundle?.focusCharacters || [])],
+            lexicalTerms: [...(bundle?.lexicalTerms || [])],
+        },
+        focusOnly: {
+            focusTerms,
+            focusCharacters,
+            lexicalTerms: focusLexicalTerms,
+        },
+        usesFocusOnlyCandidate: focusCharacters.length > 0,
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 类型定义
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * @typedef {object} QuerySegment
+ * @property {string} text        - 待 embed 的文本（含 speaker 前缀，纯自然语言）
+ * @property {number} baseWeight  - R1 基础权重
+ * @property {number} charCount   - 内容字符数（不含 speaker 前缀，用于 lengthFactor）
+ */
+
+/**
+ * @typedef {object} QueryBundle
+ * @property {QuerySegment[]}    querySegments  - R1 向量段（上下文 oldest→newest，焦点在末尾）
+ * @property {QuerySegment|null} hintsSegment   - R2 hints 段（refinement 后填充）
+ * @property {string}   focusQuery      - 当前焦点消息的纯文本
+ * @property {string}   rerankQuery     - rerank 用的纯自然语言查询（焦点在前）
+ * @property {string[]} lexicalTerms    - MiniSearch 查询词
+ * @property {string[]} focusTerms      - 焦点词（原 focusEntities）
+ * @property {string[]} focusCharacters - 最近查询窗口显式命中的可信人物（不含 name1）
+ * @property {string[]} focusEntities   - Deprecated alias of focusTerms
+ * @property {Set<string>} allEntities         - Full entity lexicon (includes non-character entities)
+ * @property {Set<string>} allCharacters       - Union of trusted and candidate character pools
+ * @property {Set<string>} trustedCharacters   - Clean character pool (main/arcs/name2/L2 participants)
+ * @property {Set<string>} candidateCharacters - Extended character pool from L0 edges.s/t after cleanup
+ * @property {function(string): string[]} _extractEntities - 本查询词典快照的实体提取
+ */
+
+// ─────────────────────────────────────────────────────────────────────────
+// 内部：消息条目构建
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * @typedef {object} MessageEntry
+ * @property {string} text      - speaker：内容（完整文本）
+ * @property {number} charCount - 内容字符数（不含 speaker 前缀）
+ */
+
+/**
+ * 清洗消息并构建条目
+ * @param {object} message - chat 消息对象
+ * @param {object} context - { name1, name2 }
+ * @returns {MessageEntry|null}
+ */
+function buildMessageEntry(message, context) {
+    if (!message?.mes) return null;
+
+    const speaker = message.is_user
+        ? (context.name1 || '用户')
+        : (message.name || context.name2 || '角色');
+
+    const clean = cleanMessageText(message.mes);
+    if (!clean) return null;
+
+    return {
+        text: `${speaker}：${clean}`,
+        charCount: clean.length,
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 阶段 1：构建 QueryBundle
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * 构建初始查询包
+ *
+ * 消息布局（K=3 时）：
+ *   msg[0] = USER(#N-2)  上下文    baseWeight = 0.15
+ *   msg[1] = AI(#N-1)    上下文    baseWeight = 0.30
+ *   msg[2] = USER(#N)    焦点      baseWeight = 0.55
+ *
+ * @param {object[]} lastMessages - 最近 K 条消息（由 recall.js 传入）
+ * @param {object|null} store
+ * @param {object|null} context - { name1, name2 }
+ * @returns {QueryBundle}
+ */
+export function buildQueryBundle(lastMessages, store = null, context = null) {
+    if (!store) store = getSummaryStore();
+    if (!context) {
+        const ctx = getContext();
+        context = { name1: ctx.name1, name2: ctx.name2 };
+    }
+
+    // 1. 实体/人物词典
+    const { lexicon, displayMap, blockedTerms, trustedCharacters, candidateCharacters, allCharacters } = getEntityVocabulary(store, context);
+
+    // 2. 分离焦点与上下文
+    const contextEntries = [];
+    let focusEntry = null;
+    let focusQuery = '';
+    const allCleanTexts = [];
+
+    const msgs = lastMessages || [];
+
+    if (msgs.length > 0) {
+        const lastMsg = msgs[msgs.length - 1];
+        const entry = buildMessageEntry(lastMsg, context);
+        if (entry) {
+            focusQuery = cleanMessageText(lastMsg.mes);
+            focusEntry = entry;
+            allCleanTexts.push(cleanMessageText(lastMsg.mes));
+        }
+    }
+
+    for (let i = 0; i < msgs.length - 1; i++) {
+        const entry = buildMessageEntry(msgs[i], context);
+        if (entry) {
+            contextEntries.push(entry);
+            allCleanTexts.push(cleanMessageText(msgs[i].mes));
+        }
+    }
+
+    // 3. 从同一个最近消息窗口提取语义词与可信人物。
+    // focusCharacters 在这里表示“查询窗口人物”，并非只来自 focusEntry；
+    // name1 在匹配阶段与人物筛选阶段均被硬排除。
+    const combinedText = allCleanTexts.join(' ');
+    injectEntities(lexicon, displayMap, blockedTerms);
+    const { extractEntities } = getTokenizerSnapshot();
+    const focusTerms = extractEntities(combinedText);
+    const focusCharacters = resolveFocusCharacters(
+        focusTerms,
+        trustedCharacters,
+        [context?.name1],
+    );
+
+    // 4. 构建 querySegments
+    //    上下文在前（oldest → newest），焦点在末尾
+    //    上下文权重从 CONTEXT_BASE_WEIGHTS 尾部对齐分配
+    const querySegments = [];
+
+    for (let i = 0; i < contextEntries.length; i++) {
+        const weightIdx = Math.max(0, CONTEXT_BASE_WEIGHTS.length - contextEntries.length + i);
+        querySegments.push({
+            text: boundRecallEmbeddingSegment(contextEntries[i].text),
+            baseWeight: CONTEXT_BASE_WEIGHTS[weightIdx] || CONTEXT_BASE_WEIGHTS[0],
+            charCount: contextEntries[i].charCount,
+        });
+    }
+
+    if (focusEntry) {
+        querySegments.push({
+            text: boundRecallEmbeddingSegment(focusEntry.text),
+            baseWeight: FOCUS_BASE_WEIGHT,
+            charCount: focusEntry.charCount,
+        });
+    }
+
+    // 5. rerankQuery（焦点在前，纯自然语言，无前缀）
+    const contextLines = contextEntries.map(e => e.text);
+    const rerankQuery = buildBoundedRerankQuery(focusEntry?.text || '', contextLines);
+
+    // 6. lexicalTerms（实体优先 + 高频实词补充）
+    const entityTerms = focusTerms.map(normalizeEntityTerm).filter(Boolean);
+    const textTerms = extractKeyTerms(combinedText);
+    const termSet = new Set(entityTerms);
+    for (const t of textTerms) {
+        if (termSet.size >= LEXICAL_TERMS_MAX) break;
+        termSet.add(t);
+    }
+
+    return {
+        querySegments,
+        hintsSegment: null,
+        focusQuery,
+        rerankQuery,
+        lexicalTerms: Array.from(termSet),
+        focusTerms,
+        focusCharacters,
+        focusEntities: focusTerms, // deprecated alias (compat)
+        allEntities: lexicon,
+        allCharacters,
+        trustedCharacters,
+        candidateCharacters,
+        _extractEntities: extractEntities,
+        _context: { name1: context?.name1 || '', name2: context?.name2 || '' },
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 阶段 3：Query Refinement（用第一轮召回结果产出 hints 段）
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * 用第一轮召回结果增强 QueryBundle
+ *
+ * 原地修改 bundle（仅 query/rerank 辅助项）：
+ * - hintsSegment：填充 hints 段（供 R2 加权使用）
+ * - lexicalTerms：可能追加 hints 中的关键词
+ * - rerankQuery：不变（保持焦点优先的纯自然语言）
+ *
+ * @param {QueryBundle} bundle - 原始查询包
+ * @param {object[]} anchorHits - 第一轮 L0 命中（按相似度降序）
+ * @param {object[]} eventHits - 第一轮 L2 命中（按相似度降序）
+ */
+export function refineQueryBundle(bundle, anchorHits, eventHits) {
+    const hints = [];
+
+    // 1. 从 top anchorHits 提取 memory hints
+    const topAnchors = (anchorHits || []).slice(0, MEMORY_HINT_ATOMS_MAX);
+    for (const hit of topAnchors) {
+        const semantic = hit.atom?.semantic || '';
+        if (semantic) hints.push(semantic);
+    }
+
+    // 2. 从 top eventHits 提取 memory hints
+    const topEvents = (eventHits || []).slice(0, MEMORY_HINT_EVENTS_MAX);
+    for (const hit of topEvents) {
+        const ev = hit.event || {};
+        const title = String(ev.title || '').trim();
+        const summary = cleanSummary(ev.summary);
+        const line = title && summary
+            ? `${title}: ${summary}`
+            : title || summary;
+        if (line) hints.push(line);
+    }
+
+    // 3. 构建 hintsSegment
+    if (hints.length > 0) {
+        const hintsText = hints.join('\n');
+        bundle.hintsSegment = {
+            text: hintsText,
+            baseWeight: HINTS_BASE_WEIGHT,
+            charCount: hintsText.length,
+        };
+    } else {
+        bundle.hintsSegment = null;
+    }
+
+    // 4. rerankQuery 不变
+    //    cross-encoder 接收纯自然语言 query，不受 hints 干扰
+
+    // 5. 增强 lexicalTerms
+    if (hints.length > 0) {
+        const hintTerms = extractKeyTerms(hints.join(' '), 5);
+        const termSet = new Set(bundle.lexicalTerms);
+        for (const t of hintTerms) {
+            if (termSet.size >= LEXICAL_TERMS_MAX) break;
+            if (!termSet.has(t)) {
+                termSet.add(t);
+                bundle.lexicalTerms.push(t);
+            }
+        }
+    }
+}

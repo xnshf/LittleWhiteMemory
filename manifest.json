@@ -1,0 +1,13 @@
+{
+    "display_name": "LittleWhiteMemory",
+    "loading_order": 10,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "author": "biex",
+    "version": "0.1.0",
+    "generate_interceptor": "littleWhiteMemoryGenerateInterceptor",
+    "hooks": {
+        "activate": "activate"
+    }
+}

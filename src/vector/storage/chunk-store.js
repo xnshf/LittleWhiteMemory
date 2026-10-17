@@ -1,0 +1,315 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Story Summary - Chunk Store (L1/L2 storage)
+// ═══════════════════════════════════════════════════════════════════════════
+
+import {
+    db,
+    metaTable,
+    chunksTable,
+    chunkVectorsTable,
+    eventVectorsTable,
+    CHUNK_MAX_TOKENS,
+} from '../../summary/data/db.js';
+import {
+    applyRecallRuntimeMutationBestEffort,
+    clearRecallRuntime,
+} from '../runtime/runtime.js';
+import { assertFiniteVector } from './vector-validation.js';
+import { runL12Mutation } from './l12-durable-copy.js';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 工具函数
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function float32ToBuffer(arr) {
+    return arr.buffer.slice(arr.byteOffset, arr.byteOffset + arr.byteLength);
+}
+
+export function bufferToFloat32(buffer) {
+    return new Float32Array(buffer);
+}
+
+export function makeChunkId(floor, chunkIdx) {
+    return `c-${floor}-${chunkIdx}`;
+}
+
+export function hashText(text) {
+    let hash = 0;
+    for (let i = 0; i < text.length; i++) {
+        hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
+    }
+    return hash.toString(36);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Meta 表操作
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function getMeta(chatId) {
+    return await metaTable.get(chatId) || {
+        chatId,
+        fingerprint: null,
+        lastChunkFloor: -1,
+        updatedAt: 0,
+    };
+}
+
+export async function updateMeta(chatId, updates) {
+    await runL12Mutation(chatId, () => db.transaction('rw', metaTable, async () => {
+        const current = await metaTable.get(chatId);
+        await metaTable.put({
+            chatId,
+            fingerprint: null,
+            lastChunkFloor: -1,
+            ...(current || {}),
+            ...updates,
+            updatedAt: Date.now(),
+        });
+    }));
+    applyRecallRuntimeMutationBestEffort(chatId, {
+        type: 'meta',
+        meta: updates,
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Chunks 表操作
+// ═══════════════════════════════════════════════════════════════════════════
+
+function makeChunkRecords(chatId, chunks) {
+    return chunks.map(chunk => ({
+        chatId,
+        chunkId: chunk.chunkId,
+        floor: chunk.floor,
+        chunkIdx: chunk.chunkIdx,
+        speaker: chunk.speaker,
+        isUser: chunk.isUser,
+        text: chunk.text,
+        textHash: chunk.textHash,
+        createdAt: Date.now(),
+    }));
+}
+
+export async function saveChunks(chatId, chunks) {
+    const records = makeChunkRecords(chatId, chunks);
+    await runL12Mutation(chatId, () => chunksTable.bulkPut(records));
+    applyRecallRuntimeMutationBestEffort(chatId, {
+        type: 'upsertChunks',
+        chunks: records,
+    });
+}
+
+export async function getAllChunks(chatId) {
+    return await chunksTable.where('chatId').equals(chatId).toArray();
+}
+
+export async function getChunksByFloors(chatId, floors) {
+    const chunks = await chunksTable
+        .where('[chatId+floor]')
+        .anyOf(floors.map(f => [chatId, f]))
+        .toArray();
+    return chunks;
+}
+
+/**
+ * 删除指定楼层及之后的所有 chunk 和向量
+ */
+export async function deleteChunksFromFloor(chatId, fromFloor) {
+    await runL12Mutation(chatId, () => db.transaction('rw', chunksTable, chunkVectorsTable, async () => {
+        const chunks = await chunksTable.where('chatId').equals(chatId).filter(c => c.floor >= fromFloor).toArray();
+        await chunksTable.where('chatId').equals(chatId).filter(c => c.floor >= fromFloor).delete();
+        for (const chunk of chunks) await chunkVectorsTable.delete([chatId, chunk.chunkId]);
+    }), { domain: 'l1', floor: fromFloor });
+    applyRecallRuntimeMutationBestEffort(chatId, {
+        type: 'deleteChunksFromFloor',
+        floor: fromFloor,
+    });
+}
+
+/**
+ * 删除指定楼层的 chunk 和向量
+ */
+export async function deleteChunksAtFloor(chatId, floor) {
+    await runL12Mutation(chatId, () => db.transaction('rw', chunksTable, chunkVectorsTable, async () => {
+        const chunks = await chunksTable.where('[chatId+floor]').equals([chatId, floor]).toArray();
+        await chunksTable.where('[chatId+floor]').equals([chatId, floor]).delete();
+        for (const chunk of chunks) await chunkVectorsTable.delete([chatId, chunk.chunkId]);
+    }), { domain: 'l1', floor, exact: true });
+    applyRecallRuntimeMutationBestEffort(chatId, {
+        type: 'deleteChunksAtFloor',
+        floor,
+    });
+}
+
+export async function clearAllChunks(chatId) {
+    await runL12Mutation(chatId, () => db.transaction('rw', chunksTable, chunkVectorsTable, async () => {
+        await chunksTable.where('chatId').equals(chatId).delete();
+        await chunkVectorsTable.where('chatId').equals(chatId).delete();
+    }), { domain: 'l1' });
+    await clearRecallRuntime(chatId, 'chunks');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ChunkVectors 表操作
+// ═══════════════════════════════════════════════════════════════════════════
+
+function makeChunkVectorRecords(chatId, items, fingerprint) {
+    let expectedDimensions = null;
+    return items.map((item, index) => {
+        const dims = assertFiniteVector(item.vector, `chunk vector ${index}`, expectedDimensions);
+        expectedDimensions ??= dims;
+        return {
+            chatId,
+            chunkId: item.chunkId,
+            inputText: item.inputText,
+            revision: crypto.randomUUID(),
+            vector: float32ToBuffer(new Float32Array(item.vector)),
+            dims,
+            fingerprint,
+        };
+    });
+}
+
+export async function saveChunkVectors(chatId, items, fingerprint) {
+    const records = makeChunkVectorRecords(chatId, items, fingerprint);
+    await runL12Mutation(chatId, () => chunkVectorsTable.bulkPut(records));
+    applyRecallRuntimeMutationBestEffort(chatId, {
+        type: 'upsertChunkVectors',
+        items: records,
+    });
+}
+
+/** 修补正文片段时原文与向量一起提交，失败不覆盖已有的有效记录。 */
+export async function saveChunkRepairs(chatId, chunks, items, fingerprint) {
+    const chunkRecords = makeChunkRecords(chatId, chunks);
+    const vectorRecords = makeChunkVectorRecords(chatId, items, fingerprint);
+    await runL12Mutation(chatId, () => db.transaction('rw', chunksTable, chunkVectorsTable, async () => {
+        await chunksTable.bulkPut(chunkRecords);
+        await chunkVectorsTable.bulkPut(vectorRecords);
+    }));
+    applyRecallRuntimeMutationBestEffort(chatId, { type: 'upsertChunks', chunks: chunkRecords });
+    applyRecallRuntimeMutationBestEffort(chatId, { type: 'upsertChunkVectors', items: vectorRecords });
+}
+
+export async function getChunkVectorDescriptors(chatId) {
+    const records = await chunkVectorsTable.where('chatId').equals(chatId).toArray();
+    return records.map(record => {
+        let valid = false;
+        try {
+            assertFiniteVector(bufferToFloat32(record.vector), 'stored chunk vector', record.dims);
+            valid = true;
+        } catch { /* 无效向量与缺失向量一样，需要补齐。 */ }
+        return { chunkId: record.chunkId, fingerprint: record.fingerprint, valid };
+    });
+}
+
+export async function getAllChunkVectors(chatId) {
+    const records = await chunkVectorsTable.where('chatId').equals(chatId).toArray();
+    return records.map(r => ({
+        ...r,
+        vector: bufferToFloat32(r.vector),
+    }));
+}
+
+export async function getChunkVectorsByIds(chatId, chunkIds, options = {}) {
+    if (!chatId || !chunkIds?.length) return [];
+    const { decode = true } = options;
+
+    const records = await chunkVectorsTable
+        .where('[chatId+chunkId]')
+        .anyOf(chunkIds.map(id => [chatId, id]))
+        .toArray();
+
+    if (!decode) {
+        return records.map(r => ({
+            chunkId: r.chunkId,
+            vector: r.vector,
+        }));
+    }
+
+    return records.map(r => ({
+        chunkId: r.chunkId,
+        vector: bufferToFloat32(r.vector),
+    }));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EventVectors 表操作
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function saveEventVectors(chatId, items, fingerprint) {
+    let expectedDimensions = null;
+    const records = items.map((item, index) => {
+        const dims = assertFiniteVector(item.vector, `event vector ${index}`, expectedDimensions);
+        expectedDimensions ??= dims;
+        return {
+            chatId,
+            eventId: item.eventId,
+            inputText: item.inputText,
+            revision: crypto.randomUUID(),
+            vector: float32ToBuffer(new Float32Array(item.vector)),
+            dims,
+            fingerprint,
+        };
+    });
+    await runL12Mutation(chatId, () => eventVectorsTable.bulkPut(records));
+    applyRecallRuntimeMutationBestEffort(chatId, {
+        type: 'upsertEventVectors',
+        items: records,
+    });
+}
+
+export async function getAllEventVectors(chatId) {
+    const records = await eventVectorsTable.where('chatId').equals(chatId).toArray();
+    return records.map(r => ({
+        ...r,
+        vector: bufferToFloat32(r.vector),
+    }));
+}
+
+export async function clearEventVectors(chatId) {
+    await runL12Mutation(chatId, () => eventVectorsTable.where('chatId').equals(chatId).delete(), { domain: 'l2' });
+    await clearRecallRuntime(chatId, 'events');
+}
+
+/**
+ * 按 ID 列表删除 event 向量
+ */
+export async function deleteEventVectorsByIds(chatId, eventIds) {
+    await runL12Mutation(chatId, () => eventVectorsTable.bulkDelete(eventIds.map(eventId => [chatId, eventId])),
+        { domain: 'l2', ids: eventIds });
+    applyRecallRuntimeMutationBestEffort(chatId, {
+        type: 'deleteEventVectorsByIds',
+        eventIds,
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 统计与工具
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function getStorageStats(chatId) {
+    const [meta, chunkCount, chunkVectorCount, eventCount] = await Promise.all([
+        getMeta(chatId),
+        chunksTable.where('chatId').equals(chatId).count(),
+        chunkVectorsTable.where('chatId').equals(chatId).count(),
+        eventVectorsTable.where('chatId').equals(chatId).count(),
+    ]);
+
+    return {
+        fingerprint: meta.fingerprint,
+        lastChunkFloor: meta.lastChunkFloor,
+        chunks: chunkCount,
+        chunkVectors: chunkVectorCount,
+        eventVectors: eventCount,
+    };
+}
+
+export async function clearChatData(chatId) {
+    await clearAllChunks(chatId);
+    await clearEventVectors(chatId);
+    await runL12Mutation(chatId, () => metaTable.delete(chatId));
+    await clearRecallRuntime(chatId);
+}
+
+export { CHUNK_MAX_TOKENS };

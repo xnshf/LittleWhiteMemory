@@ -1,0 +1,50 @@
+# 默认忽略全部；以下按类别放行
+*
+
+# 插件入口与界面
+!/manifest.json
+!/index.js
+!/settings.html
+
+# 插件源码与浏览器运行依赖（含 WASM）
+!/src/
+!/src/**
+!/libs/
+!/libs/**
+
+# 分发说明与许可证
+!/README.md
+!/docs/
+!/docs/LICENSE*
+!/docs/COPYRIGHT*
+!/docs/NOTICE*
+
+# 仓库元数据
+!/.gitignore
+!/.gitattributes
+
+# 本地开发内容一律不入库
+# 本仓库禁止执行 git clean -fdx，会连以下忽略文件一起删除
+package.json
+package-lock.json
+jsconfig.json
+scripts/
+tools/
+tests/
+*.test.js
+.eslintrc.cjs
+.eslintignore
+.editorconfig
+install-dev.ps1
+AGENTS.md
+node_modules/
+output/
+dist/
+.pi/
+.agents/
+*.log
+.env
+.env.*
+*.pem
+.DS_Store
+Thumbs.db

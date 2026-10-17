@@ -1,0 +1,313 @@
+// ============================================================================
+// atom-extraction.js - L0 场景锚点提取（v2 - 场景摘要 + 图结构）
+//
+// 设计依据：
+// - BGE-M3 (BAAI, 2024): 自然语言段落检索精度最高 → semantic = 纯自然语言
+// - TransE (Bordes, 2013): s/t/r 三元组方向性 → edges 格式
+//
+// 每楼层 1-2 个场景锚点（非碎片原子），60-100 字场景摘要
+// ============================================================================
+
+import { callLLM } from './llm-service.js';
+import {
+    createL0FailureError,
+    getL0RetryDelayMs,
+    getL0ResponseSchemaFailure,
+    isRetryableL0Failure,
+    L0_MAX_ATTEMPTS,
+    L0_MIN_SCENE_LENGTH,
+} from './l0-retry-policy.js';
+import { parseJsonResponse } from './json-response.js';
+import { xbLog } from '../../support/debug-core.js';
+import { filterText } from '../utils/text-filter.js';
+
+const MODULE_ID = 'atom-extraction';
+
+const DEFAULT_TIMEOUT = 60000;
+const DEBUG_RAW_PREVIEW_LEN = 800;
+
+// ============================================================================
+// L0 提取 Prompt
+// ============================================================================
+
+const SYSTEM_PROMPT = `你是场景摘要器。从一轮对话中提取1-2个场景锚点，用于语义检索和关系追踪。
+
+输入格式：
+<round>
+  <user name="用户名">...</user>
+  <assistant>...</assistant>
+</round>
+
+只输出严格JSON：
+{"anchors":[
+  {
+    "scene": "60-100字完整场景描述",
+    "edges": [{"s":"施事方","t":"受事方","r":"互动行为"}],
+    "where": "地点"
+  }
+]}
+
+- scene、where 和 edges.r 使用当前 <round> 正文的主要语言；混合语言时跟随主要叙事语言，并保留原文人名、专名和引语；JSON 键保持协议规定，不翻译
+
+## scene 写法
+- 纯自然语言完整句，不要任何标签/标记/枚举值
+- 用朴实白描的叙述句写，不要文学化修饰，不要抽象总结腔
+- scene 不是好看的概括，而是高召回的场景卡片；后续玩家只要隐约提到这段，也要尽量能命中
+- 优先保留：正式人名、地点、关键物件/道具、具体动作
+- 有则尽量保留：原文出现过的称呼/昵称/代称、情绪或态度、关系变化、后续可能被玩家提起的词面线索
+- 不要为了凑全字段而编造原文没有明确出现的信息；没有明确依据的内容不要硬写
+- 读者只看 scene 就能复原这一幕，也能看出别人以后会怎么提起这件事
+- 必须优先保留原词，不得擅自把昵称、称呼、道具名、地点名、暗号、身体特征、衣物、约定、秘密、羞辱/暧昧/冲突动作改写成抽象同义词
+- 禁止空泛写法，例如：两人交谈、关系升温、发生冲突、气氛暧昧、展开互动、进行交流、产生矛盾
+- 必须把抽象概括改写成具象句，写清楚谁在什么地方拿着什么、对谁做了什么；如有关键言语行为，可简要保留其内容或目的；态度和关系变化仅在这一轮里有明确依据时再写
+- 60-100字，信息密集但流畅；不要列清单，要在自然语言里尽量塞进可检索钩子
+- 信息无法全部容纳时，严格按此顺序压缩或删除：气氛描写 → 次要反应 → 心理描写 → 动作过程；必须先删完前一类，才可压缩后一类
+- 与本场景直接相关的具名实体（人名、地点、具名物件）、辨识性特征和15字以内的关键原话属于最后保留层；仅在上述四类都已不足以继续压缩时才考虑舍弃；无关名词不要强行塞入
+
+## edges（关系三元组）
+- s=施事方 t=受事方 r=互动行为（建议 6-12 字，最多 20 字）
+- s/t 必须是参与互动的角色正式名称，不用代词或别称
+- 只从正文内容中识别角色名，不要把标签名（如 user、assistant）当作角色
+- r 使用动作模板短语：“动作+对象/结果”（例：“提出交易条件”、“拒绝对方请求”、“当众揭露秘密”、“安抚对方情绪”）
+- r 不要写人名，不要复述整句，不要写心理描写或评价词
+- r 正例（合格）：提出交易条件、拒绝对方请求、当众揭露秘密、安抚对方情绪、强行打断发言、转移谈话焦点
+- r 反例（不合格）：我觉得她现在很害怕、他突然非常生气地大喊起来、user开始说话、assistant解释了很多细节
+- 每个锚点 1-3 条
+
+## where
+- 场景地点，无明确地点时空字符串
+
+## 数量规则
+- 最多2个。1个够时不凑2个
+- 明显场景切换（地点/时间/对象变化）时才2个
+- 同一场景不拆分
+- 无角色互动时返回 {"anchors":[]}
+
+## 示例
+输入：艾拉在火山口举起圣剑刺穿古龙心脏，龙血溅满她的铠甲，她跪倒在地痛哭
+输出：
+{"anchors":[{"scene":"火山口上艾拉举起圣剑刺穿古龙的心脏，龙血溅满铠甲，古龙轰然倒地，艾拉跪倒在滚烫的岩石上痛哭，完成了她不得不做的弑杀","edges":[{"s":"艾拉","t":"古龙","r":"以圣剑刺穿心脏"}],"where":"火山口"}]}`;
+
+// ============================================================================
+// 睡眠工具
+// ============================================================================
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function waitBeforeL0Retry(attempt, failure) {
+    const delayMs = getL0RetryDelayMs(attempt);
+    if (delayMs == null || !isRetryableL0Failure(failure)) return false;
+    await sleep(delayMs);
+    return true;
+}
+
+function previewText(text, maxLen = DEBUG_RAW_PREVIEW_LEN) {
+    const raw = String(text ?? '').replace(/\s+/g, ' ').trim();
+    if (!raw) return '(empty)';
+    return raw.length > maxLen ? `${raw.slice(0, maxLen)} ...(truncated)` : raw;
+}
+
+const ACTION_STRIP_WORDS = [
+    '突然', '非常', '有些', '有点', '轻轻', '悄悄', '缓缓', '立刻',
+    '马上', '然后', '并且', '而且', '开始', '继续', '再次', '正在',
+];
+
+function clamp(v, min, max) {
+    return Math.max(min, Math.min(max, v));
+}
+
+function sanitizeActionPhrase(raw) {
+    let text = String(raw || '')
+        .normalize('NFKC')
+        .replace(/[\u200B-\u200D\uFEFF]/g, '')
+        .trim();
+    if (!text) return '';
+
+    text = text
+        .replace(/[，。！？、；：,.!?;:"'“”‘’()（）[\]{}<>《》]/g, '')
+        .replace(/\s+/g, '');
+
+    for (const word of ACTION_STRIP_WORDS) {
+        text = text.replaceAll(word, '');
+    }
+
+    text = text.replace(/(地|得|了|着|过)+$/g, '');
+
+    if (text.length < 2) return '';
+    if (text.length > 12) text = text.slice(0, 12);
+    return text;
+}
+
+function calcAtomQuality(scene, edges, where) {
+    const sceneLen = String(scene || '').length;
+    const sceneScore = clamp(sceneLen / 80, 0, 1);
+    const edgeScore = clamp((edges?.length || 0) / 3, 0, 1);
+    const whereScore = where ? 1 : 0;
+    const quality = 0.55 * sceneScore + 0.35 * edgeScore + 0.10 * whereScore;
+    return Number(quality.toFixed(3));
+}
+
+// ============================================================================
+// 清洗与构建
+// ============================================================================
+
+/**
+ * 清洗 edges 三元组
+ * @param {object[]} raw
+ * @returns {object[]}
+ */
+function sanitizeEdges(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw
+        .filter(e => e && typeof e === 'object')
+        .map(e => ({
+            s: String(e.s || '').trim(),
+            t: String(e.t || '').trim(),
+            r: sanitizeActionPhrase(e.r),
+        }))
+        .filter(e => e.s && e.t && e.r)
+        .slice(0, 3);
+}
+
+/**
+ * 将解析后的 anchor 转换为 atom 存储对象
+ *
+ * semantic = scene（纯自然语言，直接用于 embedding）
+ *
+ * @param {object} anchor - LLM 输出的 anchor 对象
+ * @param {number} aiFloor - AI 消息楼层号
+ * @param {number} idx - 同楼层序号（0 或 1）
+ * @returns {object|null} atom 对象
+ */
+function anchorToAtom(anchor, aiFloor, idx) {
+    if (!anchor || typeof anchor !== 'object' || Array.isArray(anchor)) return null;
+    const scene = String(anchor.scene || '').trim();
+    if (!scene) return null;
+
+    // scene 过短（< 15 字）可能是噪音
+    if (scene.length < L0_MIN_SCENE_LENGTH) return null;
+    const edges = sanitizeEdges(anchor.edges);
+    const where = String(anchor.where || '').trim();
+    const quality = calcAtomQuality(scene, edges, where);
+
+    return {
+        atomId: `atom-${aiFloor}-${idx}`,
+        floor: aiFloor,
+        source: 'ai',
+
+        // ═══ 检索层（embedding 的唯一入口） ═══
+        semantic: scene,
+
+        // ═══ 图结构层（扩散的 key） ═══
+        edges,
+        where,
+        quality,
+    };
+}
+
+// ============================================================================
+// 单轮提取（带重试）
+// ============================================================================
+
+export async function extractAtomsForRound(userMessage, aiMessage, aiFloor, options = {}) {
+    const { timeout = DEFAULT_TIMEOUT, signal = null, shouldCancel = null } = options;
+    const isCancelled = () => (
+        signal?.aborted
+        || shouldCancel?.() === true
+    );
+
+    if (!aiMessage?.mes?.trim()) return [];
+
+    const parts = [];
+    const userName = userMessage?.name || '用户';
+
+    if (userMessage?.mes?.trim()) {
+        const userText = filterText(userMessage.mes);
+        parts.push(`<user name="${userName}">\n${userText}\n</user>`);
+    }
+
+    const aiText = filterText(aiMessage.mes);
+    parts.push(`<assistant>\n${aiText}\n</assistant>`);
+
+    const input = `<round>\n${parts.join('\n')}\n</round>\n请读取上述 <round> 内容，提取 1-2 个场景锚点，并严格按 JSON 输出。\n不要解释，不要续写，不要角色扮演，不要输出 JSON 以外的任何内容。`;
+
+    for (let attempt = 0; attempt < L0_MAX_ATTEMPTS; attempt++) {
+        if (isCancelled()) return [];
+
+        try {
+            const response = await callLLM([
+                { role: 'system', content: SYSTEM_PROMPT },
+                { role: 'user', content: input },
+            ], {
+                temperature: 0.3,
+                max_tokens: 600,
+                timeout,
+                signal,
+            });
+            if (isCancelled()) return [];
+
+            const rawText = String(response || '');
+            xbLog.info(MODULE_ID, `floor ${aiFloor} attempt ${attempt} rawText(len=${rawText.length}): ${previewText(rawText)}`);
+            if (!rawText.trim()) {
+                if (await waitBeforeL0Retry(attempt, { kind: 'empty' })) {
+                    if (isCancelled()) return [];
+                    continue;
+                }
+                throw createL0FailureError('L0 API 返回空响应', { kind: 'empty' });
+            }
+
+            xbLog.info(MODULE_ID, `floor ${aiFloor} attempt ${attempt} parseSource(len=${rawText.length}): ${previewText(rawText)}`);
+
+            const parsedResponse = parseJsonResponse(rawText);
+            if (!parsedResponse) {
+                xbLog.warn(MODULE_ID, `floor ${aiFloor} JSON解析失败 (attempt ${attempt})`);
+                if (await waitBeforeL0Retry(attempt, { kind: 'invalid_json' })) {
+                    if (isCancelled()) return [];
+                    continue;
+                }
+                throw createL0FailureError('L0 API 响应无法解析为 JSON', { kind: 'invalid_json' });
+            }
+            const parsed = parsedResponse.value;
+            if (parsedResponse.repair) {
+                xbLog.info(MODULE_ID, `floor ${aiFloor} attempt ${attempt} JSON syntax repaired=${parsedResponse.repair}`);
+            }
+
+            const schemaFailure = getL0ResponseSchemaFailure(parsed);
+            if (schemaFailure) {
+                xbLog.warn(MODULE_ID, `floor ${aiFloor} attempt ${attempt} 缺少有效 anchors，parsed=${previewText(JSON.stringify(parsed))}`);
+                if (await waitBeforeL0Retry(attempt, schemaFailure)) {
+                    if (isCancelled()) return [];
+                    continue;
+                }
+                throw createL0FailureError('L0 API 响应缺少 anchors 数组', schemaFailure);
+            }
+            const rawAnchors = parsed.anchors;
+
+            // 转换为 atom 存储格式（最多 2 个）
+            const atoms = rawAnchors
+                .slice(0, 2)
+                .map((a, idx) => anchorToAtom(a, aiFloor, idx))
+                .filter(Boolean);
+
+            xbLog.info(MODULE_ID, `floor ${aiFloor} attempt ${attempt} anchors=${rawAnchors.length} atoms=${atoms.length}`);
+
+            if (rawAnchors.length === 0) {
+                return [];
+            }
+
+            return atoms;
+
+        } catch (e) {
+            if (isCancelled() || e?.name === 'AbortError') return null;
+
+            if (await waitBeforeL0Retry(attempt, e?.l0Failure)) {
+                if (isCancelled()) return null;
+                continue;
+            }
+            xbLog.error(MODULE_ID, `floor ${aiFloor} 失败`, e);
+            throw e;
+        }
+    }
+
+    throw createL0FailureError('L0 extraction exhausted retries', { kind: 'unknown' });
+}
